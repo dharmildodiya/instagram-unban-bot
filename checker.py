@@ -32,7 +32,7 @@ _USER_AGENTS = [
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
 ]
 
-MAX_RETRIES = 3
+MAX_RETRIES = 4
 BASE_DELAY  = 2.0
 MAX_DELAY   = 30.0
 
@@ -57,6 +57,7 @@ def _check_sync(username: str, timeout: int = 15) -> str:
         proxy_dict = proxy_manager.get()
 
         try:
+            time.sleep(random.uniform(1.0, 3.0))  # random delay to avoid pattern detection
             resp = requests.get(
                 url,
                 headers=_headers(),
@@ -79,9 +80,10 @@ def _check_sync(username: str, timeout: int = 15) -> str:
                 return STATUS_BANNED
 
             if code == 429:
-                logger.warning("Rate limited on @%s (attempt %d)", username, attempt)
+                wait = 10 * attempt  # 10s, 20s, 30s between retries
+                logger.warning("Rate limited on @%s — waiting %ds (attempt %d)", username, wait, attempt)
                 proxy_manager.report_failure(proxy_dict)
-                time.sleep(min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY))
+                time.sleep(wait)
                 continue
 
             logger.warning("Unexpected HTTP %s for @%s", code, username)

@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 OWNER_IDS      = [int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip().isdigit()]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))    # seconds between full cycles
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))    # seconds between full cycles
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 HTML = ParseMode.HTML
