@@ -1,0 +1,8 @@
+.env
+monitor.db
+logs.txt
+proxies.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
