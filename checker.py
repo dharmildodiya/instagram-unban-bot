@@ -1,12 +1,6 @@
 """
-checker.py — Async Instagram account status checker.
-
-Uses aiohttp for async HTTP requests.
-Status codes:
-  200  → active
-  404  → banned / not found
-  429  → rate limited (unknown)
-  other → unknown
+checker.py — Instagram account status checker.
+Uses requests (proven to work with proxies) wrapped in asyncio executor.
 """
 
 import asyncio
@@ -14,9 +8,11 @@ import logging
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-import aiohttp
+import requests
+from requests.exceptions import ProxyError, Timeout, ConnectionError as ReqConnError
 
 from proxy_manager import proxy_manager
 
@@ -36,10 +32,11 @@ _USER_AGENTS = [
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
 ]
 
-# Backoff settings
-MAX_RETRIES   = 3
-BASE_DELAY    = 2.0   # seconds
-MAX_DELAY     = 30.0  # seconds
+MAX_RETRIES = 3
+BASE_DELAY  = 2.0
+MAX_DELAY   = 30.0
+
+_executor = ThreadPoolExecutor(max_workers=10)
 
 
 def _headers() -> dict:
@@ -49,152 +46,124 @@ def _headers() -> dict:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
 
 
-async def check_account(username: str, timeout: int = 15) -> str:
-    """
-    Check account status with retry + exponential backoff.
-    Returns STATUS_ACTIVE, STATUS_BANNED, or STATUS_UNKNOWN.
-    """
+def _check_sync(username: str, timeout: int = 15) -> str:
+    """Synchronous check — runs in thread pool."""
     url = f"https://www.instagram.com/{username}/"
 
     for attempt in range(1, MAX_RETRIES + 1):
         proxy_dict = proxy_manager.get()
-        proxy_url  = proxy_dict.get("https") if proxy_dict else None
 
         try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(
-                connector=connector,
+            resp = requests.get(
+                url,
                 headers=_headers(),
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as session:
-                async with session.get(
-                    url,
-                    proxy=proxy_url,
-                    allow_redirects=True,
-                ) as resp:
-                    status_code = resp.status
-                    final_url   = str(resp.url)
+                proxies=proxy_dict,
+                timeout=timeout,
+                allow_redirects=True,
+                verify=False,          # skip SSL verify for proxy compat
+            )
+            code = resp.status_code
+            logger.info("Check @%s → HTTP %s (attempt %d/%d)", username, code, attempt, MAX_RETRIES)
 
-                    logger.info(
-                        "Check @%s → HTTP %s (proxy: %s, attempt %d/%d)",
-                        username, status_code,
-                        (proxy_url[:30] + "...") if proxy_url else "none",
-                        attempt, MAX_RETRIES
-                    )
-
-                    if status_code == 200:
-                        proxy_manager.report_success(proxy_dict)
-                        # Redirect to login = blocked/challenge, not a real 200
-                        if "accounts/login" in final_url or "challenge" in final_url:
-                            return STATUS_UNKNOWN
-                        return STATUS_ACTIVE
-
-                    if status_code == 404:
-                        proxy_manager.report_success(proxy_dict)
-                        return STATUS_BANNED
-
-                    if status_code == 429:
-                        logger.warning("Rate limited on @%s (attempt %d)", username, attempt)
-                        proxy_manager.report_failure(proxy_dict)
-                        await _backoff(attempt)
-                        continue
-
-                    # Other unexpected codes
-                    logger.warning("Unexpected HTTP %s for @%s", status_code, username)
+            if code == 200:
+                proxy_manager.report_success(proxy_dict)
+                if "accounts/login" in resp.url or "challenge" in resp.url:
                     return STATUS_UNKNOWN
+                return STATUS_ACTIVE
 
-        except asyncio.TimeoutError:
-            logger.warning("Timeout on @%s (attempt %d/%d)", username, attempt, MAX_RETRIES)
-            proxy_manager.report_failure(proxy_dict)
-            await _backoff(attempt)
+            if code == 404:
+                proxy_manager.report_success(proxy_dict)
+                return STATUS_BANNED
 
-        except aiohttp.ClientProxyConnectionError as e:
-            logger.warning("Proxy error on @%s: %s (attempt %d)", username, e, attempt)
-            proxy_manager.report_failure(proxy_dict)
-            await _backoff(attempt)
+            if code == 429:
+                logger.warning("Rate limited on @%s (attempt %d)", username, attempt)
+                proxy_manager.report_failure(proxy_dict)
+                time.sleep(min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY))
+                continue
 
-        except aiohttp.ClientError as e:
-            logger.warning("Client error on @%s: %s (attempt %d)", username, e, attempt)
-            proxy_manager.report_failure(proxy_dict)
-            await _backoff(attempt)
-
-        except Exception as e:
-            logger.error("Unexpected error checking @%s: %s", username, e)
+            logger.warning("Unexpected HTTP %s for @%s", code, username)
             return STATUS_UNKNOWN
 
-    logger.warning("All retries exhausted for @%s — returning unknown", username)
+        except (ProxyError, ReqConnError) as e:
+            logger.warning("Proxy/connection error @%s: %s (attempt %d)", username, e, attempt)
+            proxy_manager.report_failure(proxy_dict)
+            time.sleep(min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY))
+
+        except Timeout:
+            logger.warning("Timeout @%s (attempt %d)", username, attempt)
+            proxy_manager.report_failure(proxy_dict)
+            time.sleep(min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY))
+
+        except Exception as e:
+            logger.error("Unexpected error @%s: %s", username, e)
+            return STATUS_UNKNOWN
+
+    logger.warning("All retries exhausted for @%s", username)
     return STATUS_UNKNOWN
 
 
-async def get_profile_stats(username: str, timeout: int = 15) -> Optional[dict]:
-    """
-    Scrape followers/following from profile page.
-    Returns {"followers": int, "following": int} or None.
-    """
+def _stats_sync(username: str, timeout: int = 15) -> Optional[dict]:
     url = f"https://www.instagram.com/{username}/"
     proxy_dict = proxy_manager.get()
-    proxy_url  = proxy_dict.get("https") if proxy_dict else None
-
     try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(
-            connector=connector,
-            headers=_headers(),
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as session:
-            async with session.get(url, proxy=proxy_url, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text()
+        resp = requests.get(
+            url, headers=_headers(), proxies=proxy_dict,
+            timeout=timeout, allow_redirects=True, verify=False,
+        )
+        if resp.status_code != 200:
+            return None
+        html = resp.text
 
-        # Strategy 1: meta description
         meta = re.search(
             r'([\d,\.]+[KMB]?)\s+Followers?,\s*([\d,\.]+[KMB]?)\s+Following',
             html, re.IGNORECASE
         )
         if meta:
-            return {
-                "followers": _parse_count(meta.group(1)),
-                "following": _parse_count(meta.group(2)),
-            }
+            return {"followers": _parse_count(meta.group(1)),
+                    "following": _parse_count(meta.group(2))}
 
-        # Strategy 2: JSON blob
         f1 = re.search(r'"edge_followed_by"\s*:\s*\{"count"\s*:\s*(\d+)\}', html)
         f2 = re.search(r'"edge_follow"\s*:\s*\{"count"\s*:\s*(\d+)\}', html)
         if f1 and f2:
             return {"followers": int(f1.group(1)), "following": int(f2.group(1))}
-
         return None
-
     except Exception as e:
         logger.error("Stats error @%s: %s", username, e)
         return None
 
 
+# ── Async wrappers ────────────────────────────────────────────────────────────
+
+async def check_account(username: str, timeout: int = 15) -> str:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _check_sync, username, timeout)
+
+
+async def get_profile_stats(username: str, timeout: int = 15) -> Optional[dict]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _stats_sync, username, timeout)
+
+
 async def check_accounts_batch(usernames: list[str], delay: float = 1.0) -> dict[str, str]:
-    """
-    Check multiple accounts concurrently with a semaphore to limit parallelism.
-    Returns {username: status}.
-    """
-    semaphore = asyncio.Semaphore(5)  # max 5 concurrent checks
+    """Check up to 5 accounts in parallel."""
+    semaphore = asyncio.Semaphore(5)
 
-    async def _check_one(u: str) -> tuple[str, str]:
+    async def _one(u: str) -> tuple[str, str]:
         async with semaphore:
-            status = await check_account(u)
+            s = await check_account(u)
             await asyncio.sleep(delay)
-            return u, status
+            return u, s
 
-    tasks = [asyncio.create_task(_check_one(u)) for u in usernames]
+    tasks = [asyncio.create_task(_one(u)) for u in usernames]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     out = {}
     for r in results:
         if isinstance(r, Exception):
-            logger.error("Batch check error: %s", r)
+            logger.error("Batch error: %s", r)
         else:
             u, s = r
             out[u] = s
@@ -209,9 +178,3 @@ def _parse_count(raw: str) -> int:
         return int(float(raw))
     except ValueError:
         return 0
-
-
-async def _backoff(attempt: int):
-    delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
-    jitter = random.uniform(0, delay * 0.2)
-    await asyncio.sleep(delay + jitter)

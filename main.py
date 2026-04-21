@@ -39,6 +39,8 @@ from checker import check_account, check_accounts_batch, get_profile_stats, STAT
 from notifier import broadcast, build_ban_message, build_unban_message, elapsed_since
 from proxy_manager import proxy_manager
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 # ── Logging ───────────────────────────────────────────────────────────────────

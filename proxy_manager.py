@@ -30,13 +30,26 @@ class ProxyManager:
         self._load(proxy_file)
 
     def _load(self, path: str):
+        import os
+        proxies = []
+
+        # 1. Load from file
         p = Path(path)
-        if not p.exists():
-            logger.warning("No proxy file found at %s — running without proxies", path)
-            return
-        lines = [l.strip() for l in p.read_text().splitlines() if l.strip() and not l.startswith("#")]
-        self._proxies = lines
-        logger.info("Loaded %d proxies from %s", len(self._proxies), path)
+        if p.exists():
+            lines = [l.strip() for l in p.read_text().splitlines()
+                     if l.strip() and not l.startswith("#")]
+            proxies.extend(lines)
+
+        # 2. Also load from PROXY_URL env variable (for Railway/cloud)
+        env_proxy = os.getenv("PROXY_URL", "").strip()
+        if env_proxy and env_proxy not in proxies:
+            proxies.append(env_proxy)
+
+        self._proxies = proxies
+        if proxies:
+            logger.info("Loaded %d proxy/proxies total", len(proxies))
+        else:
+            logger.warning("No proxies found in %s or PROXY_URL env — running without proxies", path)
 
     def reload(self):
         """Hot-reload proxy list."""
